@@ -14,10 +14,13 @@ import itertools
 import collections
 import pprint
 import subprocess
+import time
 
 
 # =============================================================================
-class Ext2Header( object ):
+class Ext4Header( object ):
+    # Cf.  
+    # https://ext4.wiki.kernel.org/articles/e/x/t/Ext4_Disk_Layout_aecb.html
     lStructFormat = [
         "I", "s_inodes_count",
         "I", "s_blocks_count",
@@ -26,9 +29,9 @@ class Ext2Header( object ):
         "I", "s_free_inodes_count",
         "I", "s_first_data_block",
         "I", "s_log_block_size",
-        "I", "s_log_frag_size",
+        "I", "s_log_frag_size",     # Obsolete in ext4
         "I", "s_blocks_per_group",
-        "I", "s_frags_per_group",
+        "I", "s_frags_per_group",   # Obsolete in ext4
         "I", "s_inodes_per_group",
         "I", "s_mtime",
         "I", "s_wtime",
@@ -36,7 +39,7 @@ class Ext2Header( object ):
         "H", "s_mnt_count",
         "H", "s_max_mnt_count",
         "H", "s_magic (0xEF53)",
-        "H", "s_state (1=VALID_FS, 0=ERROR_FS)",
+        "H", "s_state (1=VALID_FS, 2=ERROR_FS, 4=Orphans being recovered)",
         "H", "s_errors (1=ERRORS_CONTINUE, 2=ERRORS_RO, 3=ERRORS_PANIC)",
         "H", "s_minor_rev_level",
 
@@ -54,27 +57,39 @@ class Ext2Header( object ):
         "H", "s_block_group_nr",
 
         "I", """s_feature_compat (Mask of the following flags:
-                   FEATURE_COMPAT_DIR_PREALLOC:  0x0001
-                   FEATURE_COMPAT_IMAGIC_INODES: 0x0002
-                   FEATURE_COMPAT_HAS_JOURNAL:   0x0004
-                   FEATURE_COMPAT_EXT_ATTR:      0x0008
-                   FEATURE_COMPAT_RESIZE_INO:    0x0010
-                   FEATURE_COMPAT_DIR_INDEX:     0x0020
+                   FEATURE_COMPAT_DIR_PREALLOC:     0x0001
+                   FEATURE_COMPAT_IMAGIC_INODES:    0x0002
+                   FEATURE_COMPAT_HAS_JOURNAL:      0x0004
+                   FEATURE_COMPAT_EXT_ATTR:         0x0008
+                   FEATURE_COMPAT_RESIZE_INO:       0x0010
+                   FEATURE_COMPAT_DIR_INDEX:        0x0020
+                   Lazy BG                          0x0040
+                   Exclude inode                    0x0080
                    )
                    """,
         "I", """s_feature_incompat (Mask of the following flags:
-                   # FEATURE_INCOMPAT_COMPRESSION: 0x0001
-                   # FEATURE_INCOMPAT_FILETYPE:    0x0002
-                   # FEATURE_INCOMPAT_RECOVER:     0x0004
-                   # FEATURE_INCOMPAT_JOURNAL_DEV: 0x0008
-                   # FEATURE_INCOMPAT_META_BG:     0x0010
-                   # )
+                   FEATURE_INCOMPAT_COMPRESSION:    0x0001
+                   FEATURE_INCOMPAT_FILETYPE:       0x0002
+                   FEATURE_INCOMPAT_RECOVER:        0x0004
+                   FEATURE_INCOMPAT_JOURNAL_DEV:    0x0008
+                   FEATURE_INCOMPAT_META_BG:        0x0010
+                   Extents                          0x0040
+                   FS size of 2**64 blocks          0x0080
+                   Multiple mount protection        0x0100
+                   Flexible block groups            0x0200
+                   Data in dir entry                0x1000
+                   )
                    """,
         "I", """s_feature_ro_compat (Mask of the following flags:
-                   # FEATURE_RO_COMPAT_SPARSE_SUPER:   0x0001
-                   # FEATURE_RO_COMPAT_LARGE_FILE:     0x0002
-                   # FEATURE_RO_COMPAT_BTREE_DIR:      0x0004
-                   # )
+                   FEATURE_RO_COMPAT_SPARSE_SUPER:  0x0001
+                   FEATURE_RO_COMPAT_LARGE_FILE:    0x0002
+                   FEATURE_RO_COMPAT_BTREE_DIR:     0x0004
+                   Sizes in logical blocks          0x0008
+                   Group desc. checksums            0x0010
+                   Ext3 32k limit relaxed           0x0020
+                   Large inodes                     0x0040
+                   Snapshot                         0x0080
+                   )
                    """,
         "16s", "s_uuid (128-bit, so we'll treat it as an 8-char string)",
         "16s", "s_volume_name",
@@ -84,6 +99,7 @@ class Ext2Header( object ):
 
         "B", "s_prealloc_blocks",
         "B", "s_prealloc_dir_blocks",
+        "H", "s_reserved_gdt_blocks",
 
         "16s", "s_journal_uuid",
 
@@ -93,11 +109,69 @@ class Ext2Header( object ):
 
         "16s", "s_hash_seed (Actually 4I, but we want to keep it as a single member)",
 
-        "Bxxx", "s_def_hash_version",
+        "B", "s_def_hash_version",
+        "B", "s_jnl_backup_type",
+        "H", "s_desc_size",
 
         "I", "s_default_mount_options",
         "I", "s_first_meta_bg",
-        "760s", "Unused",
+        "I", "s_mkfs_time",
+
+        "68s", "s_jnl_blocks",  # Actually 17I, but we want to keep it as a single member
+
+        "I", "s_blocks_count_hi",
+        "I", "s_r_blocks_count_hi",
+        "I", "s_free_blocks_count_hi",
+
+        "H", "s_min_extra_isize",
+        "H", "s_want_extra_isize",
+
+        "I", "s_flags",
+
+        "H", "s_raid_stride",
+        "H", "s_mmp_interval",
+
+        "Q", "s_mmp_block",
+
+        "I", "s_raid_stripe_width",
+
+        "B", "s_log_groups_per_flex",
+        "B", "s_reserved_char_pad",
+
+        "H", "s_reserved_pad",
+
+        "Q", "s_kbytes_written",
+
+        "I", "s_snapshot_inum",
+        "I", "s_snapshot_id",
+
+        "Q", "s_snapshot_r_blocks_count",
+
+        "I", "s_snapshot_list",
+        "I", "s_error_count",
+        "I", "s_first_error_time",
+        "I", "s_first_error_ino",
+
+        "Q", "s_first_error_block",
+
+        "32s", "s_first_error_func",    # Actually 32B, but we want it as a single member
+
+        "I", "s_first_error_line",
+        "I", "s_last_error_time",
+        "I", "s_last_error_ino",
+        "I", "s_last_error_line",
+
+        "Q", "s_last_error_block",
+
+        "32s", "s_last_error_func", # Actually 32B, but we want it as a single member
+        "64s", "s_mount_opts",      # Actually 64B (ASCIIZ string)
+
+        "I", "s_usr_quota_inum",
+        "I", "s_grp_quota_inum",
+        "I", "s_overhead_blocks",
+        "I", "s_checksum",          # CRC32 checksum of superblock (PROPOSED)
+
+        "432s", "Unused",
         ]
 
     rStructFormat = "<" + "".join(
@@ -109,6 +183,7 @@ class Ext2Header( object ):
             )
 
     sStructExt2 = struct.Struct(rStructFormat)
+    assert sStructExt2.size == 1024, "Format string describes a structure with the wrong size"
 
     clsNamedTupleExt2 = collections.namedtuple(
             "Ext2", 
@@ -130,36 +205,128 @@ class Ext2Header( object ):
                 )
 
     # -------------------------------------------------------------------------
+    def get_origin(self):
+        if self.t.s_block_group_nr == 0:
+            return self.iOffset - 1024   # First superblock is always at 1024
+        else:
+            return self.iOffset - (
+                    self.t.s_blocks_per_group
+                    * self.t.s_block_group_nr
+                    * (1024 << self.t.s_log_block_size)
+                    )
+
+    # -------------------------------------------------------------------------
     def __str__(self):
-        return "%d %s (%s kB)" % (
+        return "%d %s #%d %s kB %d bpg, origin %d" % (
                 self.iOffset,
                 self.t.s_volume_name, 
-                1024 << self.t.s_log_block_size
+                self.t.s_block_group_nr,
+                1024 << self.t.s_log_block_size,
+                self.t.s_blocks_per_group,
+                self.get_origin(),
                 )
 
     # -------------------------------------------------------------------------
-    def __call__(self, rImageFile):
-        lCommand = [
-                "dumpe2fs",
-                "-o", "blocksize=%d" % (1024 << self.t.s_log_block_size),
-                "-o", "superblock=%d" % (self.iOffset / (1024 << self.t.s_log_block_size)),
-                rImageFile,
-                ]
-
+    def __call__(self, rImageFile, yStopOnValid=False):
         with file(os.devnull, "w+r") as sDevNull:
-            return subprocess.call(
+            lCommand = [
+                    "losetup",
+                    "--find",
+                    "--read-only",
+                    "--verbose",
+                    rImageFile,
+                    "--offset", str(self.get_origin()),
+                    ]
+
+            rOutput = subprocess.check_output(
                     lCommand,
                     stdin=sDevNull,
-                    stdout=sDevNull,
-                    stderr=sDevNull,
                     shell=False,
                     )
+
+            if not rOutput.startswith("Loop device is "):
+                return False
+
+            rDevice = rOutput[len("Loop device is "):].strip()
+
+            iReturnCode = 1
+            try:
+                lCommand = [
+                        "dumpe2fs",
+                        "-o", "blocksize=%d" % (
+                            1024 << self.t.s_log_block_size),
+                        "-o", "superblock=%d" % (
+                            self.t.s_block_group_nr * self.t.s_blocks_per_group),
+                        rDevice,
+                        ]
+
+                iReturnCode = subprocess.call(
+                        lCommand,
+                        stdin=sDevNull,
+                        stdout=sDevNull,
+                        stderr=sDevNull,
+                        shell=False,
+                        )
+
+                return iReturnCode
+
+            finally:
+                if yStopOnValid and iReturnCode == 0:
+                    print "Exiting due to --stop-on-valid. File-system is at %s" % rDevice
+                    print "Recommended next step: fsck.ext4 -C 0 -n -f -B %d -b %d %s" % (
+                            1024 << self.t.s_log_block_size,
+                            self.t.s_block_group_nr * self.t.s_blocks_per_group,
+                            rDevice,
+                            )
+                    exit()
+
+                lCommand = [
+                        "losetup",
+                        "--detach",
+                        rDevice,
+                        ]
+
+                while True:
+                    try:
+                        subprocess.check_call(
+                                lCommand,
+                                stdin=sDevNull,
+                                stdout=sDevNull,
+                                stderr=sDevNull,
+                                shell=False,
+                                )
+                    except:
+                        time.sleep(0.01)
+                        continue
+                    else:
+                        break
+
 
 # =============================================================================
 if __name__ == "__main__":
     sOptionParser = optparse.OptionParser(usage="%prog [options] disk_image")
     sOptionParser.description = __doc__
-    lOpts, lArgs = sOptionParser.parse_args()
+
+    sOptionParser.add_option(
+            "--check",
+            help="Validate superblock with dumpe2fs",
+            action="store_true",
+            default=False,
+            dest="yCheck",
+            )
+
+    sOptionParser.add_option(
+            "--stop-on-valid",
+            help="(Implies --check) Exit immediately if check succeeds.",
+            action="store_true",
+            default=False,
+            dest="yStop",
+            )
+
+    sOpts, lArgs = sOptionParser.parse_args()
+
+    if sOpts.yStop:
+        sOpts.yCheck = True
 
     rImageFile = lArgs[0]
 
@@ -180,11 +347,16 @@ if __name__ == "__main__":
         if iHeaderOffset < 0:
             # Means that the `re` module has truncated the offset value. Abort.
             break
-        sHeader = Ext2Header(sMap, iHeaderOffset)
-        if sHeader(rImageFile) == 0:
-            print
-            print "OK\t%s" % sHeader
-            print
+
+        sHeader = Ext4Header(sMap, iHeaderOffset)
+
+        if sOpts.yCheck:
+            if sHeader(rImageFile, yStopOnValid=sOpts.yStop) == 0:
+                print "OK\t%s %s" % (rImageFile, sHeader)
+            else:
+                print "BAD\t%s %s" % (rImageFile, sHeader)
         else:
-            print "FAIL\t%s" % sHeader
+            print "%s %s" % (rImageFile, sHeader)
+
+
         sys.stdout.flush()
