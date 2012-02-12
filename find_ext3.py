@@ -1,6 +1,10 @@
 #!/usr/bin/env python
 """
-Find ext3 file-system within a disk image.
+Find ext3 file-system within a disk image, and optionally perform a (shallow) 
+test of the file-systems' validity.
+
+Note that the --check option requires that you can create/detach loopback 
+devices with 'losetup'
 """
 __docformat__ = "reStructuredText en_gb"
 
@@ -183,7 +187,8 @@ class Ext4Header( object ):
             )
 
     sStructExt2 = struct.Struct(rStructFormat)
-    assert sStructExt2.size == 1024, "Format string describes a structure with the wrong size"
+    assert sStructExt2.size == 1024, \
+            "Format string describes a structure with the wrong size"
 
     clsNamedTupleExt2 = collections.namedtuple(
             "Ext2", 
@@ -228,6 +233,23 @@ class Ext4Header( object ):
 
     # -------------------------------------------------------------------------
     def __call__(self, rImageFile, yStopOnValid=False):
+        """
+        Perform a (shallow) check of this superblock within its containing 
+        file, `rImageFile`.
+
+        :Parameters:
+            rImageFile : str
+                File-system path to a file-like object that holds this 
+                superblock at offset `self.iOffset`.
+            yStopOnValid : bool
+                If this is set and the check suggests the superblock is valid 
+                exit the script immediately.
+
+        :Returns:
+            0: Superblock does not seem valid
+            1: Superblock seems valid
+            None: Check could not be performed (`losetup` permission problems?)
+        """
         with file(os.devnull, "w+r") as sDevNull:
             lCommand = [
                     "losetup",
@@ -238,16 +260,26 @@ class Ext4Header( object ):
                     "--offset", str(self.get_origin()),
                     ]
 
-            rOutput = subprocess.check_output(
-                    lCommand,
-                    stdin=sDevNull,
-                    shell=False,
-                    )
+            rOutput = ""
+            iRetries = 10
+            while iRetries > 0:
+                iRetries -= 1
+                try:
+                    rOutput = subprocess.check_output(
+                            lCommand,
+                            stdin=sDevNull,
+                            shell=False,
+                            )
+                except:
+                    time.sleep(0.1)
+                    continue
+                else:
+                    break
 
-            if not rOutput.startswith("Loop device is "):
-                return False
+            if ("Loop device is ") not in rOutput:
+                return None
 
-            rDevice = rOutput[len("Loop device is "):].strip()
+            rDevice = rOutput.partition("Loop device is ")[2].strip()
 
             iReturnCode = 1
             try:
@@ -256,7 +288,9 @@ class Ext4Header( object ):
                         "-o", "blocksize=%d" % (
                             1024 << self.t.s_log_block_size),
                         "-o", "superblock=%d" % (
-                            self.t.s_block_group_nr * self.t.s_blocks_per_group),
+                            self.t.s_block_group_nr
+                            * self.t.s_blocks_per_group
+                            ),
                         rDevice,
                         ]
 
@@ -268,14 +302,18 @@ class Ext4Header( object ):
                         shell=False,
                         )
 
-                return iReturnCode
+                return {0: 1}.get(iReturnCode, 0)
 
             finally:
                 if yStopOnValid and iReturnCode == 0:
-                    print "Exiting due to --stop-on-valid. File-system is at %s" % rDevice
-                    print "Recommended next step: fsck.ext4 -C 0 -n -f -B %d -b %d %s" % (
+                    print "Exiting due to --stop-on-valid. " \
+                          " File-system is at %s" % rDevice
+
+                    print "Recommended next step: " \
+                          "fsck.ext4 -C 0 -n -f -B %d -b %d %s" % (
                             1024 << self.t.s_log_block_size,
-                            self.t.s_block_group_nr * self.t.s_blocks_per_group,
+                            self.t.s_block_group_nr
+                            * self.t.s_blocks_per_group,
                             rDevice,
                             )
                     exit()
@@ -302,6 +340,46 @@ class Ext4Header( object ):
                         break
 
 
+# -----------------------------------------------------------------------------
+def gen_chunks(iStart, iFinish, iCount=10000, iMinChunkSize=0):
+    """
+    Return a generator that yields `iCount` offsets that overlap by at least 
+    1024 bytes (the size of an Ext4 header).
+
+    :Parameters:
+        iStart : int
+            Beginning of range to yield
+        iFinish : int
+            End of range to yield
+        iCount : int
+            Maximum number of chunks to yield. May yield fewer due to need to 
+            overlap by 1024 bytes.
+        iMinChunkSize : int
+            Minimum range to cover with a pair of offsets. Any value provided 
+            will be subject to clamping in order to guarantee that progress can 
+            be made.
+
+    :RType: Generator
+    :Returns:
+        Iterable that yields 2-tuples of integers (iStart, iEnd)
+    """
+    iOverlap = 1024
+    iRange = iFinish - iStart
+
+    iChunkSize = (iRange + iOverlap) // iCount
+
+    # Worst-case: Cover every offset twice
+    iMinChunkSize = max(iMinChunkSize, 2 * iOverlap)
+    iChunkSize = max(iChunkSize, iMinChunkSize)
+
+    iEnd = iStart + iChunkSize
+
+    yield iStart, min(iEnd, iFinish)
+    while iEnd < iFinish:
+        iStart += iChunkSize - iOverlap
+        iEnd += iChunkSize - iOverlap
+        yield iStart, min(iEnd, iFinish)
+
 # =============================================================================
 if __name__ == "__main__":
     sOptionParser = optparse.OptionParser(usage="%prog [options] disk_image")
@@ -323,6 +401,25 @@ if __name__ == "__main__":
             dest="yStop",
             )
 
+    sOptionParser.add_option(
+            "--start",
+            help="Starting offset, defaults to 0",
+            action="store",
+            type="int",
+            default=0,
+            dest="iStart",
+            )
+
+    sOptionParser.add_option(
+            "--finish",
+            help="Final offset, defaults to end of file",
+            action="store",
+            type="int",
+            default=None,
+            dest="iFinish",
+            )
+
+
     sOpts, lArgs = sOptionParser.parse_args()
 
     if sOpts.yStop:
@@ -341,22 +438,69 @@ if __name__ == "__main__":
 
     # Cf. http://www.nongnu.org/ext2-doc/ext2.html#SUPERBLOCK
     # Magic bytes are (0x53, 0xef), and sit at offset 56 (bytes)
-    # Volume name ("label") is 16 bytes at offset 120 (bytes)
-    for sMatch in re.finditer(chr(0x53)+chr(0xef)+".{62}[a-zA-Z0-1]{0,15}"+chr(0), sMap):
-        iHeaderOffset = sMatch.start() - 56
-        if iHeaderOffset < 0:
-            # Means that the `re` module has truncated the offset value. Abort.
-            break
+    # Volume name ("label") is 16 bytes (NULL terminated) at offset 120 (bytes)
 
-        sHeader = Ext4Header(sMap, iHeaderOffset)
+    sPattern = re.compile(chr(0x53)+chr(0xef)+".{62}[a-zA-Z0-1]{0,15}"+chr(0))
 
-        if sOpts.yCheck:
-            if sHeader(rImageFile, yStopOnValid=sOpts.yStop) == 0:
-                print "OK\t%s %s" % (rImageFile, sHeader)
-            else:
-                print "BAD\t%s %s" % (rImageFile, sHeader)
-        else:
-            print "%s %s" % (rImageFile, sHeader)
+    iStart = sOpts.iStart
+    iFinish = sOpts.iFinish or iSize
+    iFinish = max(iFinish, iStart+1024)
+    iFinish = min(iFinish, iSize)
 
+    for iStartPos, iEndPos in gen_chunks(
+            iStart,
+            iFinish,
+            iCount=float("+inf"),           # As many as possible
+            iMinChunkSize=8*1024*1024,
+            ):
+        try:
+            for sMatch in sPattern.finditer(sMap, iStartPos, iEndPos):
+                iHeaderOffset = sMatch.start() - 56
 
-        sys.stdout.flush()
+                # WORK-AROUND:
+                #
+                # There seems to be in a bug in the `re` module that ships with 
+                # CPython v2.7.2+ (on linxu2): sMatch.start() can return 
+                # negative values, followed by offsets that indicate it has 
+                # searched backwards. Clearly the real offset is being 
+                # truncated to 32 bits and interpreted as a signed integer.
+
+                if iHeaderOffset < 0:
+                    print "INTERNAL ERROR: " \
+                          "Search returned an invalid offset. Aborting"
+                    exit(1)
+
+                sHeader = Ext4Header(sMap, iHeaderOffset)
+
+                # Display findings
+
+                if sOpts.yCheck:
+                    iStatus = sHeader(rImageFile, yStopOnValid=sOpts.yStop)
+                    if iStatus is None:
+                        print "ERROR\t%s %s" % (rImageFile, sHeader)
+                    elif iStatus == 1:
+                        print "OK\t%s %s" % (rImageFile, sHeader)
+                    elif iStatus == 0:
+                        print "BAD\t%s %s" % (rImageFile, sHeader)
+                    else:
+                        assert False, \
+                                "Unhandled status code from sHeader.__call__"
+                else:
+                    print "%s %s" % (rImageFile, sHeader)
+
+                sys.stdout.flush()
+
+            # Display progress update
+
+            print >> sys.stderr, "Progress: %.2f%%\t(%d of %d)" % (
+                    100 * (float(iEndPos) / iFinish),
+                    iEndPos,
+                    iFinish,
+                    )
+
+            sys.stderr.flush()
+
+        except:
+            print "Aborting at offset %d" % iStartPos
+            sys.stderr.flush()
+            raise
