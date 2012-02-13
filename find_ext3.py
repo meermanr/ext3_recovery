@@ -209,6 +209,23 @@ class Ext4Header( object ):
                 *self.sStructExt2.unpack_from(sMap, iOffset)
                 )
 
+        # Sanity checks (raise ValueError)
+        if self.t.s_log_block_size > 16:
+            raise ValueError("s_log_block_size too big: %d" \
+                    % self.t.s_log_block_size)
+
+        if self.t.s_log_groups_per_flex > 16:
+            raise ValueError("s_log_groups_per_flex too big: %d" \
+                    % self.t.s_log_groups_per_flex)
+
+        if self.t.s_log_frag_size > 16:
+            raise ValueError("s_log_frag_size too big: %d" \
+                    % self.t.s_log_frag_size)
+
+        if not self.t.s_volume_name.partition("\x00")[0].isalnum():
+            raise ValueError("s_volume_name is not ASCII: %s" \
+                    % self.t.s_volume_name)
+
     # -------------------------------------------------------------------------
     def get_origin(self):
         if self.t.s_block_group_nr == 0:
@@ -451,44 +468,45 @@ if __name__ == "__main__":
             iStart,
             iFinish,
             iCount=float("+inf"),           # As many as possible
-            iMinChunkSize=8*1024*1024,
+            iMinChunkSize=512*1024*1024,
             ):
         try:
-            for sMatch in sPattern.finditer(sMap, iStartPos, iEndPos):
-                iHeaderOffset = sMatch.start() - 56
+            iPos = iStartPos
+            # Note: iPos==-1 when there is no match in this chunk
+            while iStartPos <= iPos <= iEndPos:
+                try:
+                    iPos = sMap.find("\x53\xEF", iPos, iEndPos)
 
-                # WORK-AROUND:
-                #
-                # There seems to be in a bug in the `re` module that ships with 
-                # CPython v2.7.2+ (on linxu2): sMatch.start() can return 
-                # negative values, followed by offsets that indicate it has 
-                # searched backwards. Clearly the real offset is being 
-                # truncated to 32 bits and interpreted as a signed integer.
+                    if iPos == -1:
+                        # No match in this chunk
+                        break
 
-                if iHeaderOffset < 0:
-                    print "INTERNAL ERROR: " \
-                          "Search returned an invalid offset. Aborting"
-                    exit(1)
+                    iHeaderOffset = iPos - 56
+                    sHeader = Ext4Header(sMap, iHeaderOffset)
 
-                sHeader = Ext4Header(sMap, iHeaderOffset)
+                    # Display findings
 
-                # Display findings
-
-                if sOpts.yCheck:
-                    iStatus = sHeader(rImageFile, yStopOnValid=sOpts.yStop)
-                    if iStatus is None:
-                        print "ERROR\t%s %s" % (rImageFile, sHeader)
-                    elif iStatus == 1:
-                        print "OK\t%s %s" % (rImageFile, sHeader)
-                    elif iStatus == 0:
-                        print "BAD\t%s %s" % (rImageFile, sHeader)
+                    if sOpts.yCheck:
+                        iStatus = sHeader(rImageFile, yStopOnValid=sOpts.yStop)
+                        if iStatus is None:
+                            print "ERROR\t%s %s" % (rImageFile, sHeader)
+                        elif iStatus == 1:
+                            print "OK\t%s %s" % (rImageFile, sHeader)
+                        elif iStatus == 0:
+                            print "BAD\t%s %s" % (rImageFile, sHeader)
+                        else:
+                            assert False, \
+                                    "Unhandled status code from sHeader.__call__"
                     else:
-                        assert False, \
-                                "Unhandled status code from sHeader.__call__"
-                else:
-                    print "%s %s" % (rImageFile, sHeader)
+                        print "%s %s" % (rImageFile, sHeader)
 
-                sys.stdout.flush()
+                    sys.stdout.flush()
+
+                except ValueError as sEx:
+                    continue
+
+                finally:
+                    iPos += 1
 
             # Display progress update
 
@@ -502,5 +520,5 @@ if __name__ == "__main__":
 
         except:
             print "Aborting at offset %d" % iStartPos
-            sys.stderr.flush()
+            sys.stdout.flush()
             raise
