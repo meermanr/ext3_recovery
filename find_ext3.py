@@ -267,6 +267,9 @@ class Ext4Header( object ):
             1: Superblock seems valid
             None: Check could not be performed (`losetup` permission problems?)
         """
+        if self.get_origin() < 0:
+            return None
+
         with file(os.devnull, "w+r") as sDevNull:
             lCommand = [
                     "losetup",
