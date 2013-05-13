@@ -202,6 +202,8 @@ class Ext4Header( object ):
                 )
             )
 
+    sTriedOffsets = set()
+
     # -------------------------------------------------------------------------
     def __init__(self, sMap, iOffset):
         self.iOffset = iOffset
@@ -265,10 +267,16 @@ class Ext4Header( object ):
         :Returns:
             0: Superblock does not seem valid
             1: Superblock seems valid
+            2: Skipped, has been checked before
             None: Check could not be performed (`losetup` permission problems?)
         """
         if self.get_origin() < 0:
             return None
+
+        if self.get_origin() in self.sTriedOffsets:
+            return 2
+        else:
+            self.sTriedOffsets.add(self.get_origin())
 
         with file(os.devnull, "w+r") as sDevNull:
             lCommand = [
@@ -493,6 +501,8 @@ if __name__ == "__main__":
                         iStatus = sHeader(rImageFile, yStopOnValid=sOpts.yStop)
                         if iStatus is None:
                             print "ERROR\t%s %s" % (rImageFile, sHeader)
+                        elif iStatus == 2:
+                            print "SKIP\t%s %s" % (rImageFile, sHeader)
                         elif iStatus == 1:
                             print "OK\t%s %s" % (rImageFile, sHeader)
                         elif iStatus == 0:
